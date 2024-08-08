@@ -1,13 +1,14 @@
 
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const socketIo = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io = socketIo(server, {
   cors: {
     origin: '*',
   },
@@ -16,149 +17,121 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-const MessageSchema = new mongoose.Schema({
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
+
+const messageSchema = new mongoose.Schema({
   user: String,
   userContact: String,
   friendContact: String,
   message: String,
-  delivered: { type: Boolean, default: false },
-  read: { type: Boolean, default: false },
-}, { timestamps: true });
+  reactions: [{ emoji: String }],
+  seen: { type: Boolean, default: false },
+});
 
-const ProfileSchema = new mongoose.Schema({
-  contact: { type: String, unique: true },
+const Message = mongoose.model('Message', messageSchema);
+
+const userSchema = new mongoose.Schema({
+  contactNumber: String,
   name: String,
-  profilePicture: String,
-  status: String,
-  bio: String,
-  pin: String,
 });
 
-const ContactSchema = new mongoose.Schema({
-  userContact: String,
-  contact: String,
-  name: String,
-  profilePicture: String,
-  status: String,
-  bio: String,
-});
+const User = mongoose.model('User', userSchema);
 
-const Message = mongoose.model('Message', MessageSchema);
-const Profile = mongoose.model('Profile', ProfileSchema);
-const Contact = mongoose.model('Contact', ContactSchema);
-
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-}).then(() => {
-  console.log('Connected to MongoDB');
-}).catch((err) => {
-  console.error('MongoDB connection error:', err.message);
-});
+let users = {};
 
 io.on('connection', (socket) => {
-  console.log('a user connected');
+  console.log('A user connected');
 
-  socket.on('register', (contact) => {
-    socket.join(contact);
+  socket.on('register', async (userContact) => {
+    try {
+      let user = await User.findOne({ contactNumber: userContact });
+      if (!user) {
+        user = new User({ contactNumber: userContact });
+        await user.save();
+      }
+      users[userContact] = { socketId: socket.id, lastSeen: new Date() };
+      io.emit('onlineStatus', { userContact, isOnline: true, lastSeen: null });
+    } catch (error) {
+      console.error('Error registering user:', error);
+    }
   });
 
   socket.on('sendMessage', async (data) => {
     try {
-      const message = new Message(data);
-      await message.save();
-      io.to(data.friendContact).emit('receiveMessage', message);
-      io.to(data.userContact).emit('messageDelivered', message._id);
+      const newMessage = new Message(data);
+      await newMessage.save();
+      io.emit('receiveMessage', newMessage);
     } catch (error) {
-      console.error('Error saving message:', error.message);
-      socket.emit('error', 'Message could not be saved');
+      console.error('Error saving message:', error);
     }
   });
 
-  socket.on('messageRead', async (messageId) => {
+  socket.on('addReaction', async ({ messageId, emoji }) => {
     try {
-      await Message.findByIdAndUpdate(messageId, { read: true });
       const message = await Message.findById(messageId);
-      io.to(message.userContact).emit('messageRead', messageId);
+      if (message) {
+        message.reactions.push({ emoji });
+        await message.save();
+        io.emit('receiveMessage', message); // Optionally, send an update to all clients
+      }
     } catch (error) {
-      console.error('Error updating message read status:', error.message);
+      console.error('Error adding reaction:', error);
     }
+  });
+
+  socket.on('deleteMessage', async (messageId) => {
+    try {
+      await Message.findByIdAndDelete(messageId);
+      io.emit('deleteMessage', messageId); // Optionally, send an update to all clients
+    } catch (error) {
+      console.error('Error deleting message:', error);
+    }
+  });
+
+  socket.on('typing', ({ userContact, friendContact, isTyping }) => {
+    const friendSocket = users[friendContact]?.socketId;
+    if (friendSocket) {
+      io.to(friendSocket).emit('typing', { userContact, isTyping });
+    }
+  });
+
+  socket.on('getOnlineStatus', ({ userContact }) => {
+    const user = users[userContact];
+    if (user) {
+      io.to(socket.id).emit('onlineStatus', {
+        userContact,
+        isOnline: true,
+        lastSeen: user.lastSeen,
+      });
+    }
+  });
+
+  socket.on('messageSeen', ({ messageId, friendContact }) => {
+    Message.findById(messageId).then((message) => {
+      if (message && message.friendContact === friendContact) {
+        message.seen = true;
+        message.save();
+        io.emit('receiveMessage', message);
+      }
+    });
   });
 
   socket.on('disconnect', () => {
-    console.log('user disconnected');
+    for (const [contact, user] of Object.entries(users)) {
+      if (user.socketId === socket.id) {
+        users[contact].lastSeen = new Date();
+        io.emit('onlineStatus', { userContact: contact, isOnline: false, lastSeen: users[contact].lastSeen });
+        delete users[contact];
+        break;
+      }
+    }
+    console.log('A user disconnected');
   });
 });
 
-app.post('/setProfile', async (req, res) => {
-  try {
-    const profile = new Profile(req.body);
-    await profile.save();
-    res.status(201).json(profile);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.post('/verifyPin', async (req, res) => {
-  try {
-    const { contact, pin } = req.body;
-    const profile = await Profile.findOne({ contact });
-    if (profile && profile.pin === pin) {
-      res.status(200).json({ success: true });
-    } else {
-      res.status(200).json({ success: false });
-    }
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.get('/contacts', async (req, res) => {
-  try {
-    const { userContact, search } = req.query;
-    const contacts = await Contact.find({
-      userContact,
-      $or: [
-        { contact: { $regex: search, $options: 'i' } },
-        { name: { $regex: search, $options: 'i' } },
-      ],
-    });
-    res.status(200).json(contacts);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.post('/addContact', async (req, res) => {
-  try {
-    const contact = new Contact(req.body);
-    await contact.save();
-    res.status(201).json(contact);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.put('/editContact/:id', async (req, res) => {
-  try {
-    const contact = await Contact.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    res.status(200).json(contact);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-app.delete('/deleteContact/:id', async (req, res) => {
-  try {
-    await Contact.findByIdAndDelete(req.params.id);
-    res.status(200).json({ message: 'Contact deleted' });
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+server.listen(4000, () => {
+  console.log('Server is running on port 4000');
 });
